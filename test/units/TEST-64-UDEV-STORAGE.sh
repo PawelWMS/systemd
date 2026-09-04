@@ -1394,14 +1394,38 @@ testcase_mdadm_lvm() {
     helper_check_device_units
 }
 
+# This covers systemd-fsck on a partitioned physical disk. Stacked devices and
+# the separate dissect-image fsck path are outside this test's scope.
 testcase_fsck_locking() {
     local disk=/dev/disk/by-id/scsi-0systemd_foobar_deadbeeffscklock
     local partition="${disk}-part1"
     local work=/run/test-fsck-locking
-    local real_disk holder_fd fsck_pid monitor_pid
+    local cursor="$work/journal.cursor"
+    local ready="$work/checker-ready"
+    local release="$work/checker-release"
+    local real_disk real_disk_syspath holder_fd fsck_pid trigger_pid
 
     mkdir -p "$work/bin" "$work/credentials"
     real_disk="$(readlink -f "$disk")"
+    real_disk_syspath="/sys$(udevadm info --query=path --name="$real_disk")"
+
+    trap '
+        trap - RETURN
+        if [[ -n ${trigger_pid:-} ]]; then
+            kill "$trigger_pid" 2>/dev/null || :
+            wait "$trigger_pid" 2>/dev/null || :
+        fi
+        if [[ -n ${fsck_pid:-} ]]; then
+            kill "$fsck_pid" 2>/dev/null || :
+            wait "$fsck_pid" 2>/dev/null || :
+        fi
+        if [[ -n ${holder_fd:-} ]]; then
+            flock --unlock "$holder_fd" 2>/dev/null || :
+            exec {holder_fd}>&-
+        fi
+        udevadm control --log-level=info 2>/dev/null || :
+        rm -rf "$work"
+    ' RETURN
 
     udevadm lock --timeout=30 --device="$disk" sfdisk --wipe=always "$disk" <<EOF
 label: gpt
@@ -1414,21 +1438,19 @@ EOF
     cat >"$work/bin/fsck" <<'EOF'
 #!/usr/bin/env bash
 set -eux
-
 printf '%s\n' "$@" >"$FSCK_TEST_ARGUMENTS"
 
-for fd in /proc/self/fd/*; do
-    target="$(readlink -f "$fd")" || continue
-    if [[ "$target" == "$FSCK_TEST_DISK" ]]; then
-        echo >&2 "Inherited whole-disk lock descriptor: $fd"
-        exit 1
-    fi
-done
-
 if [[ "$FSCK_EXPECT_PARENT_LOCK" == 1 ]] &&
-   flock --exclusive --nonblock "$FSCK_TEST_DISK" true; then
-    echo >&2 "Parent whole-disk lock is not held"
+   flock --shared --nonblock "$FSCK_TEST_DISK" true; then
+    echo >&2 "Parent whole-disk lock is not exclusive"
     exit 1
+fi
+
+if [[ ${FSCK_TEST_HOLD:-0} == 1 ]]; then
+    exec {release_fd}<>"$FSCK_TEST_RELEASE"
+    printf 'READY\n' >"$FSCK_TEST_READY"
+    IFS= read -r -t 90 -u "$release_fd" command
+    [[ "$command" == RELEASE ]]
 fi
 
 touch "$FSCK_TEST_MARKER"
@@ -1440,50 +1462,91 @@ EOF
     export FSCK_TEST_MARKER="$work/checker-invoked"
     export PATH="$work/bin:$PATH"
 
-    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER" "$work/udev-events"
-    stdbuf -oL udevadm monitor --udev --property --subsystem-match=block >"$work/udev-events" 2>&1 &
-    monitor_pid=$!
-    for _ in {1..100}; do
-        if test -s "$work/udev-events" && kill -0 "$monitor_pid"; then
-            break
-        fi
-        sleep 0.1
-    done
-    test -s "$work/udev-events"
-    kill -0 "$monitor_pid"
-    FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition"
+    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER" "$cursor" "$ready" "$release"
+    mkfifo "$ready" "$release"
+    exec {holder_fd}<"$real_disk"
+    flock --exclusive "$holder_fd"
+    FSCK_EXPECT_PARENT_LOCK=1 \
+    FSCK_TEST_HOLD=1 \
+    FSCK_TEST_READY="$ready" \
+    FSCK_TEST_RELEASE="$release" \
+        timeout --kill-after=5s 90s /usr/lib/systemd/systemd-fsck "$partition" &
+    fsck_pid=$!
+
+    # shellcheck disable=SC2016
+    if timeout --kill-after=1s 1s bash -c \
+        'IFS= read -r value <"$1" && [[ "$value" == READY ]]' \
+        bash "$ready"; then
+        echo >&2 "Checker started while the external whole-disk lock was held"
+        return 1
+    fi
+
+    flock --unlock "$holder_fd"
+    # shellcheck disable=SC2016
+    timeout --kill-after=5s 30s bash -c \
+        'IFS= read -r value <"$1" && [[ "$value" == READY ]]' \
+        bash "$ready"
+    kill -0 "$fsck_pid"
+    if flock --shared --nonblock "$real_disk" true; then
+        echo >&2 "Parent whole-disk lock is not exclusive"
+        return 1
+    fi
+
+    udevadm control --log-level=debug
+    udevadm control --ping
+    journalctl --sync
+    journalctl --cursor-file="$cursor" -n0 -q
+    timeout --kill-after=5s 60s \
+        udevadm trigger --settle --action=change "$partition" &
+    trigger_pid=$!
+
+    # shellcheck disable=SC2016
+    timeout --kill-after=5s 30s bash -c '
+        until journalctl \
+                --after-cursor="$(<"$1")" \
+                --unit=systemd-udevd.service \
+                --output=cat \
+                --grep="Block device $2 is currently locked, requeuing the event." \
+                --no-pager -q >/dev/null; do
+            sleep 0.1
+        done
+    ' bash "$cursor" "$real_disk"
+    kill -0 "$trigger_pid"
+    kill -0 "$fsck_pid"
+    if flock --shared --nonblock "$real_disk" true; then
+        echo >&2 "Parent released whole-disk lock before checker exit"
+        return 1
+    fi
+
+    # shellcheck disable=SC2016
+    timeout --kill-after=2s 5s bash -c \
+        'printf "RELEASE\n" >"$1"' \
+        bash "$release"
+    wait "$fsck_pid"
+    fsck_pid=
+    wait "$trigger_pid"
+    trigger_pid=
     test -e "$FSCK_TEST_MARKER"
     udevadm settle --timeout=30
     flock --exclusive --nonblock "$real_disk" true
 
-    for _ in {1..100}; do
-        if grep -F "ACTION=change" "$work/udev-events" >/dev/null &&
-           grep -F "DEVNAME=$real_disk" "$work/udev-events" >/dev/null; then
-            break
-        fi
-        sleep 0.1
-    done
-    kill "$monitor_pid" 2>/dev/null || :
-    wait "$monitor_pid" || :
-    grep -F "ACTION=change" "$work/udev-events" >/dev/null
-    grep -F "DEVNAME=$real_disk" "$work/udev-events" >/dev/null
-
-    exec {holder_fd}<"$real_disk"
-    flock --exclusive "$holder_fd"
-    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER"
-    FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition" &
-    fsck_pid=$!
-    sleep 1
-    test ! -e "$FSCK_TEST_MARKER"
-    flock --unlock "$holder_fd"
-    wait "$fsck_pid"
-    test -e "$FSCK_TEST_MARKER"
+    # shellcheck disable=SC2016
+    timeout --kill-after=5s 30s bash -c '
+        until journalctl \
+                --after-cursor="$(<"$1")" \
+                --unit=systemd-udevd.service \
+                --output=cat \
+                --grep="device is closed, synthesising .change. on $2" \
+                --no-pager -q >/dev/null; do
+            sleep 0.1
+        done
+    ' bash "$cursor" "$real_disk_syspath"
 
     printf 'no' >"$work/credentials/fsck.repair"
     flock --exclusive "$holder_fd"
     rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER"
     CREDENTIALS_DIRECTORY="$work/credentials" FSCK_EXPECT_PARENT_LOCK=0 \
-        timeout 5 /usr/lib/systemd/systemd-fsck "$partition"
+        timeout --kill-after=5s 30s /usr/lib/systemd/systemd-fsck "$partition"
     test -e "$FSCK_TEST_MARKER"
     grep -Fx -- "-n" "$FSCK_TEST_ARGUMENTS" >/dev/null
     flock --unlock "$holder_fd"
@@ -1491,6 +1554,9 @@ EOF
 
     udevadm lock --timeout=30 --device="$disk" wipefs --all "$disk"
     udevadm settle --timeout=30
+    trap - RETURN
+    udevadm control --log-level=info
+    rm -rf "$work"
 }
 
 udevadm settle
