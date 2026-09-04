@@ -406,6 +406,9 @@ static int run(int argc, char *argv[]) {
 
                 /* Child */
 
+                /* The parent alone retains the lock while the checker runs. */
+                lock_fd = safe_close(lock_fd);
+
                 /* Close the reading side of the progress pipe */
                 progress_pipe[0] = safe_close(progress_pipe[0]);
 
