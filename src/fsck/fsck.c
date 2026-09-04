@@ -461,7 +461,7 @@ static int run(int argc, char *argv[]) {
                 progress_pipe[1] = safe_close(progress_pipe[1]);
                 (void) process_progress(TAKE_FD(progress_pipe[0]), console);
         }
-        exit_status = pidref_wait_for_terminate_and_check("fsck", &pidref, WAIT_LOG_ABNORMAL);
+
         exit_status = pidref_wait_for_terminate_and_check("fsck", &pidref, WAIT_LOG_ABNORMAL);
         if (exit_status < 0)
                 return exit_status;
