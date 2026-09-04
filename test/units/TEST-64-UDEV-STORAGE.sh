@@ -1394,6 +1394,97 @@ testcase_mdadm_lvm() {
     helper_check_device_units
 }
 
+testcase_fsck_locking() {
+    local disk=/dev/disk/by-id/scsi-0systemd_foobar_deadbeeffscklock
+    local partition="${disk}-part1"
+    local work=/run/test-fsck-locking
+    local real_disk holder_fd fsck_pid monitor_pid
+
+    mkdir -p "$work/bin" "$work/credentials"
+    real_disk="$(readlink -f "$disk")"
+
+    udevadm lock --timeout=30 --device="$disk" sfdisk --wipe=always "$disk" <<EOF
+label: gpt
+size=32M, type=linux
+EOF
+    udevadm wait --settle --timeout=30 "$partition"
+    udevadm lock --timeout=30 --device="$partition" mkfs.ext4 -q "$partition"
+    udevadm trigger --settle "$partition"
+
+    cat >"$work/bin/fsck" <<'EOF'
+#!/usr/bin/env bash
+set -eux
+
+printf '%s\n' "$@" >"$FSCK_TEST_ARGUMENTS"
+
+for fd in /proc/self/fd/*; do
+    target="$(readlink -f "$fd")" || continue
+    if [[ "$target" == "$FSCK_TEST_DISK" ]]; then
+        echo >&2 "Inherited whole-disk lock descriptor: $fd"
+        exit 1
+    fi
+done
+
+if [[ "$FSCK_EXPECT_PARENT_LOCK" == 1 ]] &&
+   flock --exclusive --nonblock "$FSCK_TEST_DISK" true; then
+    echo >&2 "Parent whole-disk lock is not held"
+    exit 1
+fi
+
+touch "$FSCK_TEST_MARKER"
+EOF
+    chmod +x "$work/bin/fsck"
+
+    export FSCK_TEST_ARGUMENTS="$work/arguments"
+    export FSCK_TEST_DISK="$real_disk"
+    export FSCK_TEST_MARKER="$work/checker-invoked"
+    export PATH="$work/bin:$PATH"
+
+    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER" "$work/udev-events"
+    stdbuf -oL udevadm monitor --udev --property --subsystem-match=block >"$work/udev-events" &
+    monitor_pid=$!
+    sleep 0.2
+    FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition"
+    test -e "$FSCK_TEST_MARKER"
+    flock --exclusive --nonblock "$real_disk" true
+
+    for _ in {1..100}; do
+        if grep -F "ACTION=change" "$work/udev-events" >/dev/null &&
+           grep -F "DEVNAME=$real_disk" "$work/udev-events" >/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    kill "$monitor_pid"
+    wait "$monitor_pid" || :
+    grep -F "ACTION=change" "$work/udev-events" >/dev/null
+    grep -F "DEVNAME=$real_disk" "$work/udev-events" >/dev/null
+
+    exec {holder_fd}<"$real_disk"
+    flock --exclusive "$holder_fd"
+    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER"
+    FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition" &
+    fsck_pid=$!
+    sleep 1
+    test ! -e "$FSCK_TEST_MARKER"
+    flock --unlock "$holder_fd"
+    wait "$fsck_pid"
+    test -e "$FSCK_TEST_MARKER"
+
+    printf 'no\n' >"$work/credentials/fsck.repair"
+    flock --exclusive "$holder_fd"
+    rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER"
+    CREDENTIALS_DIRECTORY="$work/credentials" FSCK_EXPECT_PARENT_LOCK=0 \
+        timeout 5 /usr/lib/systemd/systemd-fsck "$partition"
+    test -e "$FSCK_TEST_MARKER"
+    grep -Fx -- "-n" "$FSCK_TEST_ARGUMENTS" >/dev/null
+    flock --unlock "$holder_fd"
+    exec {holder_fd}>&-
+
+    udevadm lock --timeout=30 --device="$disk" wipefs --all "$disk"
+    udevadm settle --timeout=30
+}
+
 udevadm settle
 lsblk -a
 
