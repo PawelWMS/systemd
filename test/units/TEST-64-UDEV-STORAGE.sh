@@ -1472,7 +1472,7 @@ EOF
     wait "$fsck_pid"
     test -e "$FSCK_TEST_MARKER"
 
-    printf 'no\n' >"$work/credentials/fsck.repair"
+    printf 'no' >"$work/credentials/fsck.repair"
     flock --exclusive "$holder_fd"
     rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER"
     CREDENTIALS_DIRECTORY="$work/credentials" FSCK_EXPECT_PARENT_LOCK=0 \
