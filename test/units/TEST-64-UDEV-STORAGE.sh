@@ -1438,7 +1438,8 @@ EOF
     udevadm wait --settle --timeout=30 "$partition"
     udevadm lock --timeout=30 --device="$partition" mkfs.ext4 -q "$partition"
     udevadm trigger --settle "$partition"
-    # Keep the watch armed across change events and override distro nowatch rules.
+    # Distro rules do not always watch whole disks, but this test needs IN_CLOSE_WRITE
+    # to synthesize a change event when systemd-fsck closes its writable descriptor.
     printf 'SUBSYSTEM=="block", KERNEL=="%s", OPTIONS:="watch"\n' "${real_disk##*/}" >"$watch_rule"
     udevadm control --reload
     udevadm trigger --settle --action=change "$real_disk"
