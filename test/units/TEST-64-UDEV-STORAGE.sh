@@ -1441,9 +1441,16 @@ EOF
     export PATH="$work/bin:$PATH"
 
     rm -f "$FSCK_TEST_ARGUMENTS" "$FSCK_TEST_MARKER" "$work/udev-events"
-    stdbuf -oL udevadm monitor --udev --property --subsystem-match=block >"$work/udev-events" &
+    stdbuf -oL udevadm monitor --udev --property --subsystem-match=block >"$work/udev-events" 2>&1 &
     monitor_pid=$!
-    sleep 0.2
+    for _ in {1..100}; do
+        if test -s "$work/udev-events" && kill -0 "$monitor_pid"; then
+            break
+        fi
+        sleep 0.1
+    done
+    test -s "$work/udev-events"
+    kill -0 "$monitor_pid"
     FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition"
     test -e "$FSCK_TEST_MARKER"
     udevadm settle --timeout=30
