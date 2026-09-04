@@ -1446,6 +1446,7 @@ EOF
     sleep 0.2
     FSCK_EXPECT_PARENT_LOCK=1 /usr/lib/systemd/systemd-fsck "$partition"
     test -e "$FSCK_TEST_MARKER"
+    udevadm settle --timeout=30
     flock --exclusive --nonblock "$real_disk" true
 
     for _ in {1..100}; do
