@@ -377,12 +377,6 @@ static int run(int argc, char *argv[]) {
             pipe(progress_pipe) < 0)
                 return log_error_errno(errno, "pipe(): %m");
 
-        int except_fds[2];
-        size_t n_except_fds = 0;
-        FOREACH_ELEMENT(fd, progress_pipe)
-                if (*fd >= 0)
-                        except_fds[n_except_fds++] = *fd;
-
         if (arg_repair != FSCK_REPAIR_NO) {
                 dev_t devnum;
 
@@ -398,12 +392,9 @@ static int run(int argc, char *argv[]) {
         }
 
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
-        r = pidref_safe_fork_full(
+        r = pidref_safe_fork(
                         "(fsck)",
-                        /* stdio_fds= */ NULL,
-                        except_fds,
-                        n_except_fds,
-                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
                         &pidref);
         if (r < 0)
                 return r;
