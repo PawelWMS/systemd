@@ -1565,13 +1565,13 @@ EOF
 
     udevadm lock --timeout=30 --device="$disk" wipefs --all "$disk"
     udevadm settle --timeout=30
-    trap - RETURN
     udevadm control --log-level=info
     rm -f "$watch_rule"
     udevadm control --reload
     udevadm trigger --settle --action=change "$real_disk"
     test ! -e "/run/udev/watch/b${major}:${minor}"
     rm -rf "$work"
+    trap - RETURN
 }
 
 udevadm settle
