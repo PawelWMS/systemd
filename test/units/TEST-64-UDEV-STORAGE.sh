@@ -1403,9 +1403,10 @@ testcase_fsck_locking() {
     local cursor="$work/journal.cursor"
     local ready="$work/checker-ready"
     local release="$work/checker-release"
-    local real_disk real_disk_syspath holder_fd fsck_pid trigger_pid
+    local watch_rule=/run/udev/rules.d/99-test-fsck-locking.rules
+    local real_disk real_disk_syspath major minor holder_fd fsck_pid trigger_pid
 
-    mkdir -p "$work/bin" "$work/credentials"
+    mkdir -p "$work/bin" "$work/credentials" /run/udev/rules.d
     real_disk="$(readlink -f "$disk")"
     real_disk_syspath="/sys$(udevadm info --query=path --name="$real_disk")"
 
@@ -1424,6 +1425,9 @@ testcase_fsck_locking() {
             exec {holder_fd}>&-
         fi
         udevadm control --log-level=info 2>/dev/null || :
+        rm -f "$watch_rule"
+        udevadm control --reload 2>/dev/null || :
+        udevadm trigger --settle --action=change "$real_disk" 2>/dev/null || :
         rm -rf "$work"
     ' RETURN
 
@@ -1434,6 +1438,13 @@ EOF
     udevadm wait --settle --timeout=30 "$partition"
     udevadm lock --timeout=30 --device="$partition" mkfs.ext4 -q "$partition"
     udevadm trigger --settle "$partition"
+    # Keep the watch armed across change events and override distro nowatch rules.
+    printf 'SUBSYSTEM=="block", KERNEL=="%s", OPTIONS:="watch"\n' "${real_disk##*/}" >"$watch_rule"
+    udevadm control --reload
+    udevadm trigger --settle --action=change "$real_disk"
+    major="$(udevadm info --query=property --value --property=MAJOR "$real_disk")"
+    minor="$(udevadm info --query=property --value --property=MINOR "$real_disk")"
+    test -L "/run/udev/watch/b${major}:${minor}"
 
     cat >"$work/bin/fsck" <<'EOF'
 #!/usr/bin/env bash
@@ -1556,6 +1567,10 @@ EOF
     udevadm settle --timeout=30
     trap - RETURN
     udevadm control --log-level=info
+    rm -f "$watch_rule"
+    udevadm control --reload
+    udevadm trigger --settle --action=change "$real_disk"
+    test ! -e "/run/udev/watch/b${major}:${minor}"
     rm -rf "$work"
 }
 
