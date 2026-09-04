@@ -377,6 +377,12 @@ static int run(int argc, char *argv[]) {
             pipe(progress_pipe) < 0)
                 return log_error_errno(errno, "pipe(): %m");
 
+        int except_fds[2];
+        size_t n_except_fds = 0;
+        FOREACH_ELEMENT(fd, progress_pipe)
+                if (*fd >= 0)
+                        except_fds[n_except_fds++] = *fd;
+
         if (arg_repair != FSCK_REPAIR_NO) {
                 dev_t devnum;
 
@@ -392,9 +398,12 @@ static int run(int argc, char *argv[]) {
         }
 
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
-        r = pidref_safe_fork(
+        r = pidref_safe_fork_full(
                         "(fsck)",
-                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        /* stdio_fds= */ NULL,
+                        except_fds,
+                        n_except_fds,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
                         &pidref);
         if (r < 0)
                 return r;
@@ -405,9 +414,6 @@ static int run(int argc, char *argv[]) {
                 int i = 0;
 
                 /* Child */
-
-                /* The parent alone retains the lock while the checker runs. */
-                lock_fd = safe_close(lock_fd);
 
                 /* Close the reading side of the progress pipe */
                 progress_pipe[0] = safe_close(progress_pipe[0]);
