@@ -1456,7 +1456,7 @@ EOF
         fi
         sleep 0.1
     done
-    kill "$monitor_pid"
+    kill "$monitor_pid" 2>/dev/null || :
     wait "$monitor_pid" || :
     grep -F "ACTION=change" "$work/udev-events" >/dev/null
     grep -F "DEVNAME=$real_disk" "$work/udev-events" >/dev/null
